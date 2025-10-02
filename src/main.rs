@@ -2,15 +2,16 @@ use ringbuf::consumer::Consumer;
 use ringbuf::producer::Producer;
 use std::error::Error;
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio::time::interval;
 
 mod audio;
 mod config;
 mod net;
+mod codec;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {

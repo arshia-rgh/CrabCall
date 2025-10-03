@@ -1,7 +1,5 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{
-    BufferSize, Device, SampleFormat, SampleRate, Stream, StreamConfig, SupportedBufferSize,
-};
+use cpal::{BufferSize, Device, SampleFormat, SampleRate, Stream, StreamConfig};
 use ringbuf::consumer::Consumer;
 use ringbuf::producer::Producer;
 use ringbuf::traits::Split;
@@ -85,8 +83,12 @@ impl Audio {
         self.sample_rate
     }
 
-    pub fn capture_occupancy_arc(&self) -> Arc<AtomicUsize> { Arc::clone(&self.cap_occupancy) }
-    pub fn playback_occupancy_arc(&self) -> Arc<AtomicUsize> { Arc::clone(&self.play_occupancy) }
+    pub fn capture_occupancy_arc(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.cap_occupancy)
+    }
+    pub fn playback_occupancy_arc(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.play_occupancy)
+    }
 
     pub fn take_capture_consumer(&mut self) -> Result<HeapCons<f32>, Box<dyn Error>> {
         self.cap_cons

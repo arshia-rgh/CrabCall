@@ -9,9 +9,9 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::time::interval;
 
 mod audio;
+mod codec;
 mod config;
 mod net;
-mod codec;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let occupancy = audio_obj.playback_occupancy_arc();
     let play_capacity = audio_obj.playback_capacity();
 
-    println!("Audio chat running (mono -> speakers).");
+    println!("Audio chat running (mono).");
     println!("Sample rate: {sample_rate} Hz, frame: {frame_sample} samples (20 ms).");
 
     let local: SocketAddr = std::env::var("LOCAL")
@@ -45,26 +45,47 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let jb = Arc::new(Mutex::new(net::JitterBuffer::new(0)));
 
+    // Choose codec: Opus or PCM
+    let codec: Arc<Mutex<dyn codec::AudioCodec>> =
+        Arc::new(Mutex::new(codec::OpusCodec::new(sample_rate)?));
+    // let codec: Arc<Mutex<dyn codec::AudioCodec>> = Arc::new(Mutex::new(
+    //     codec::PcmCodec::new(sample_rate, frame_sample)
+    // ));
+
+    // Spawn sender task
     {
         let sock_clone = Arc::clone(&sock);
-        let jb_clone = Arc::clone(&jb);
+        let codec_clone = Arc::clone(&codec);
         tokio::spawn(async move {
-            let _ = net::run_receiver(sock_clone, jb_clone).await;
-        });
-    }
-    {
-        let jb_clone = Arc::clone(&jb);
-        tokio::spawn(async move {
-            let _ = net::run_playout(jb_clone, tx_playout, 20).await;
-        });
-    }
-    {
-        let sock_clone = Arc::clone(&sock);
-        tokio::spawn(async move {
-            let _ = net::run_sender(sock_clone, remote, rx_frames, sample_rate, 1).await;
+            if let Err(e) = net::run_sender(sock_clone, remote, rx_frames, codec_clone, 1).await {
+                eprintln!("Sender error: {e}");
+            }
         });
     }
 
+    // Spawn receiver task
+    {
+        let sock_clone = Arc::clone(&sock);
+        let jb_clone = Arc::clone(&jb);
+        let codec_clone = Arc::clone(&codec);
+        tokio::spawn(async move {
+            if let Err(e) = net::run_receiver(sock_clone, jb_clone, codec_clone).await {
+                eprintln!("Receiver error: {e}");
+            }
+        });
+    }
+
+    // Spawn playout task
+    {
+        let jb_clone = Arc::clone(&jb);
+        tokio::spawn(async move {
+            if let Err(e) = net::run_playout(jb_clone, tx_playout, 20).await {
+                eprintln!("Playout error: {e}");
+            }
+        });
+    }
+
+    // Capture task: read from audio input -> encode -> send
     tokio::spawn({
         let mut cap_cons = capture_consumer;
         let tx = tx_frames.clone();
@@ -85,6 +106,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
+    // Playback task: receive decoded frames -> write to audio output
     let occ_push = Arc::clone(&occupancy);
     tokio::spawn(async move {
         while let Some(pcm16) = rx_playout.recv().await {
@@ -103,8 +125,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
+    // Stats reporting
     let mut stats_tick = interval(Duration::from_millis(1000));
     let mut occ_tick = interval(Duration::from_millis(250));
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -121,7 +145,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             _ = occ_tick.tick() => {
                 let occ_samples = occupancy.load(Ordering::Relaxed);
                 let lag_ms = (occ_samples as f64) * 1000.0 / (sample_rate as f64);
-                println!("audio: buffer={} samples (~{lag_ms:.1} ms, frame ~= {frame_sample} samples)", occ_samples);
+                println!(
+                    "audio: buffer={} samples (~{lag_ms:.1} ms)",
+                    occ_samples
+                );
             }
         }
     }

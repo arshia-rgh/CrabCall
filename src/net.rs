@@ -1,9 +1,10 @@
+use crate::codec::{FMT_OPUS, FMT_PCM};
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tokio::time::interval;
 
 const MAGIC: [u8; 4] = *b"AUD0";
@@ -202,7 +203,7 @@ fn seq_gt(a: u32, b: u32) -> bool {
 }
 
 pub async fn run_sender(
-    socket: std::sync::Arc<UdpSocket>,
+    socket: Arc<UdpSocket>,
     dest: SocketAddr,
     mut frames_rx: mpsc::Receiver<Vec<i16>>,
     sample_rate: u32,
@@ -245,8 +246,8 @@ pub async fn run_sender(
 }
 
 pub async fn run_receiver(
-    socket: std::sync::Arc<UdpSocket>,
-    jb: Arc<tokio::sync::Mutex<JitterBuffer>>,
+    socket: Arc<UdpSocket>,
+    jb: Arc<Mutex<JitterBuffer>>,
 ) -> anyhow::Result<()> {
     let mut buf = vec![0u8; 2048];
     loop {
@@ -255,7 +256,7 @@ pub async fn run_receiver(
             continue;
         }
         if let Some((h, payload)) = read_header(&buf[..n]) {
-            if h.fmt != 1 {
+            if h.fmt != FMT_PCM {
                 continue;
             }
             let need = (h.n_samples as usize) * 2;
@@ -274,8 +275,77 @@ pub async fn run_receiver(
     }
 }
 
+pub async fn run_sender_opus(
+    socket: Arc<UdpSocket>,
+    dest: SocketAddr,
+    mut rx: mpsc::Receiver<(u16, u32, Vec<u8>)>, // (n_samples, sample_rate, encoded)
+    mut seq: u32,
+) -> anyhow::Result<()> {
+    while let Some((n_samples, sample_rate, packet)) = rx.recv().await {
+        let total = HEADER_SIZE + packet.len();
+        if total > MAX_UDP_PAYLOAD {
+            eprintln!(
+                "Encoded packet {}B exceeds MTU {}B. Drop.",
+                total, MAX_UDP_PAYLOAD
+            );
+            continue;
+        }
+        let h = Header {
+            seq,
+            ts_ms: now_ms(),
+            n_samples,
+            sample_rate,
+            fmt: FMT_OPUS,
+        };
+        seq = seq.wrapping_add(1);
+        let mut buf = vec![0u8; total];
+        write_header(&h, (&mut buf[..HEADER_SIZE]).try_into()?);
+        buf[HEADER_SIZE..].copy_from_slice(&packet);
+        let _ = socket.send_to(&buf, dest).await?;
+    }
+    Ok(())
+}
+
+pub async fn run_receiver_opus(
+    socket: Arc<UdpSocket>,
+    jb: Arc<Mutex<JitterBuffer>>,
+    codec: Arc<Mutex<crate::codec::OpusCodec>>,
+) -> anyhow::Result<()> {
+    let mut buf = vec![0u8; 2048];
+    loop {
+        let (n, _from) = socket.recv_from(&mut buf).await?;
+        if n < HEADER_SIZE {
+            continue;
+        }
+        if let Some((h, payload)) = read_header(&buf[..n]) {
+            if h.fmt != FMT_OPUS {
+                continue;
+            }
+            let mut codec_guard = codec.lock().await;
+            // Decode (expected samples = h.n_samples)
+            match codec_guard.decode(payload, h.n_samples as usize) {
+                Ok(pcm) => {
+                    if pcm.len() != h.n_samples as usize {
+                        // Accept shorter (Opus may output expected size; if not, pad)
+                        let mut adj = pcm;
+                        adj.resize(h.n_samples as usize, 0);
+                        let mut g = jb.lock().await;
+                        g.push(h, adj);
+                    } else {
+                        let mut g = jb.lock().await;
+                        g.push(h, pcm);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Opus decode error: {e}");
+                }
+            }
+        }
+    }
+}
+
 pub async fn run_playout(
-    jb: Arc<tokio::sync::Mutex<JitterBuffer>>,
+    jb: Arc<Mutex<JitterBuffer>>,
     out_tx: mpsc::Sender<Vec<i16>>,
     frame_ms: u64, // 20
 ) -> anyhow::Result<()> {
